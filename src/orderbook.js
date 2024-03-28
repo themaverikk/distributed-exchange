@@ -1,23 +1,104 @@
 'use strict'
 
 const async = require('async');
-const { OrderTypes, OrderStatus } = require('./enum');
+const util = require('util');
+const { PeerRPCClient } = require('grenache-nodejs-ws');
+const Link = require('grenache-nodejs-link');
+const { OrderTypes } = require('./enum');
 
 class OrderBook {
-    constructor(clientID) {
-        this.clientID = clientID;
+    constructor(clientId) {
+        this.clientId = clientId;
+        this.client = this.initializeClient();
         this.buyOrders = [];
         this.sellOrders = [];
-
-        // Create a queue with a concurrency of 1 to ensure only one order is processed at a time
-        this.orderQueue = async.queue((task, done) => {
-            this.processOrder(task.order);
-            done(task.order);
-        }, 1);
     }
 
-    done = order => {
-        order.status = OrderStatus.SUCCESS
+    initializeClient = () => {
+        const link = new Link({
+            grape: 'http://127.0.0.1:30001',
+            requestTimeout: 10000
+        });
+        link.start();
+
+        const client = new PeerRPCClient(link, {});
+        client.init();
+
+        return client;
+    }
+
+    updateOrder = order => {
+        const list = order.type === OrderTypes.BUY ? this.buyOrders : this.sellOrders;
+
+        const matchingOrderIndex = list.findIndex(o => o.orderId === order.orderId);
+
+        if (matchingOrderIndex < 0) {
+            return;
+        }
+
+        // if the order is fully filled, remove it from the list. Idealy we should just update it's status, but for simplicity, we just remove it
+        if (order.quantity === 0) {
+            console.log('Removing orderId:', order.orderId, 'from orderbook as its been filled');
+            list.splice(matchingOrderIndex, 1);
+        } else {
+            list[matchingOrderIndex].quantity = order.quantity;
+        }
+    }
+
+
+    processOrder = order => {
+        if (order.type === OrderTypes.BUY) {
+            this.matchBuyOrder(order);
+        } else {
+            this.matchSellOrder(order);
+        }
+    }
+
+
+    matchBuyOrder = order => {
+        while (this.sellOrders.length > 0 && order.quantity > 0 && order.price >= this.sellOrders[this.sellOrders.length - 1].price) {
+            const matchedSellOrder = this.sellOrders[this.sellOrders.length - 1];
+            const tradeQuantity = Math.min(order.quantity, matchedSellOrder.quantity);
+
+            order.quantity -= tradeQuantity;
+            matchedSellOrder.quantity -= tradeQuantity;
+
+            if (matchedSellOrder.quantity === 0) {
+                this.sellOrders.pop();
+            }
+            if (order.quantity === 0) {
+                console.log('Order fulfilled, orderId:', order.orderId, ', price: ', matchedSellOrder.price, ', quantity:', tradeQuantity);
+            } else {
+                console.log('Order partially fulfilled, orderId:', order.orderId, ', price: ', matchedSellOrder.price, ', quantity:', tradeQuantity);
+            }
+        }
+
+        this.client.request('client_' + order.clientId, order, { timeout: 10000 });
+        return order;
+    }
+
+
+    matchSellOrder = order => {
+        while (this.buyOrders.length > 0 && order.quantity > 0 && order.price <= this.buyOrders[this.buyOrders.length - 1].price) {
+            const matchedBuyOrder = this.buyOrders[this.buyOrders.length - 1];
+            const tradeQuantity = Math.min(order.quantity, matchedBuyOrder.quantity);
+
+            order.quantity -= tradeQuantity;
+            matchedBuyOrder.quantity -= tradeQuantity;
+
+            if (matchedBuyOrder.quantity === 0) {
+                this.buyOrders.pop();
+            }
+
+            if (order.quantity === 0) {
+                console.log('Order fulfilled, orderId:', order.orderId, ', price:', order.price, ', quantity:', tradeQuantity);
+            } else {
+                console.log('Order partially fulfilled, orderId:', order.orderId, ', price:', order.price, ', quantity:', tradeQuantity);
+            }
+        }
+        this.client.request('client_' + order.clientId, order, { timeout: 10000 });
+
+        return order;
     }
 
     addOrder = order => {
@@ -25,63 +106,16 @@ class OrderBook {
         const list = order.type === OrderTypes.BUY ? this.buyOrders : this.sellOrders;
         list.push(order);
         this.sortOrders(list, order.type);
-
-        // Try to match orders if they're from different 
-        this.matchOrders();
     }
 
     sortOrders = (list, type) => {
-        // Sort buy orders in descending order of price, sell orders in ascending order
+        // Sort buy orders in ascending order of price, sell orders in descending order
         if (type === OrderTypes.BUY) {
-            list.sort((a, b) => b.price - a.price);
-        } else {
             list.sort((a, b) => a.price - b.price);
-        }
-    }
-
-
-    processOrder = order => {
-        if (order.type === OrderTypes.BUY) {
-            return matchBuyOrder(order);
         } else {
-            return matchSellOrder(order);
+            list.sort((a, b) => b.price - a.price);
         }
     }
-
-    matchBuyOrder = order => {
-        order.quantity -= 1;
-        return order;
-    }
-
-    matchOrder = order => {
-        // Match BUY order against SELL orders, and vice versa
-        const list = order.type === OrderTypes.BUY ? this.sellOrders : this.buyOrders;
-
-        // While there are orders to match
-        while (list.length > 0) {
-            const matchingOrder = list[0];
-
-            // If the top buy order price is at least the top sell order price
-            if (buyOrder.price >= sellOrder.price) {
-                const quantity = Math.min(buyOrder.quantity, sellOrder.quantity);
-
-                // Update quantities
-                buyOrder.quantity -= quantity;
-                sellOrder.quantity -= quantity;
-
-                // Remove the order from the list if it is fully matched
-                if (buyOrder.quantity === 0) this.buyOrders.shift();
-                if (sellOrder.quantity === 0) this.sellOrders.shift();
-
-                // Here you would handle the transfer of assets between clients
-            } else {
-                // No more matches can be made
-                break;
-            }
-        }
-    }
-
-
 }
 
 module.exports = OrderBook;

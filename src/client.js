@@ -1,69 +1,75 @@
 'use strict';
 
 const OrderBook = require('./orderbook');
-const { PeerRPCClient, PeerRPCServer } = require('grenache-nodejs-http');
+const { PeerRPCClient, PeerRPCServer } = require('grenache-nodejs-ws');
 const Link = require('grenache-nodejs-link');
 
 // Client instance with its own orderbook
 class Client {
-  constructor(clientId, port) {
+  constructor(clientId, port, orderQueue) {
+    this.clientId = clientId;
+    this.orderQueue = orderQueue;
+    this.orderBook = new OrderBook(clientId);
 
-    this.clientId = clientId
-    this.orderBook = new OrderBook();
-
-    const link = this.initializeLink();
-    this.initializeServer(link, port);
-    this.client = this.initializeClient(link);
-  }
-
-  initializeLink = () => {
-    const link = new Link({
-      grape: 'http://127.0.0.1:30001',
-      requestTimeout: 10000
-    })
-    link.start();
-
-    return link;
-  }
-
-  initializeServer = (link, port) => {
-    const server = new PeerRPCServer(link, { timeout: 300000 });
-    server.init();
-
-    // Listen for incoming requests
-    const service = server.transport('server');
-    service.listen(port);
-
-    // Announce service
-    setInterval(() => {
-      link.announce('distributed_exchange', service.port, {});
-    }, 1000);
-
-    service.on('request', (rid, key, order, handler) => {
-      if (order.clientId !== this.clientId) {
-        const returnedOrder = this.orderBook.processOrder(order);
-
-        console.log(returnedOrder);
+    // service that will trigger fulfillment of order, it will add the order to an async queue with concurrency 1
+    this.initService('order_submit_service', port, (rid, key, order, handler) => {
+      if (order.quantity > 0 && order.clientId !== this.clientId) {
+        this.orderQueue.push(order, order => {
+          this.orderBook.processOrder(order);
+        });
       }
-      handler.reply(null, 'SUCCESS');
+
+      handler.reply(null, order);
+    });
+
+    // service that will update the orderBook after an order is fulfilled
+    // TODO: configure separate port for this service
+    this.initService('client_' + this.clientId, port + 10, (rid, key, order, handler) => {
+      this.orderBook.updateOrder(order);
+      handler.reply(null, order);
     });
   }
 
-  initializeClient = link => {
-    const client = new PeerRPCClient(link, {});
-    client.init();
+  initService = (serviceName, port, callback) => {
+    const link = new Link({
+      grape: 'http://127.0.0.1:30001',
+      requestTimeout: 10000
+    });
+    link.start();
 
-    return client;
+    const server = new PeerRPCServer(link, {});
+    server.init();
+
+    const service = server.transport('server');
+    service.listen(port);
+
+    setInterval(() => {
+      link.announce(serviceName, service.port, {});
+    }, 1000);
+
+    service.on('request', callback);
+  }
+
+  initializeClient = () => {
+    const link = new Link({
+      grape: 'http://127.0.0.1:30001',
+      requestTimeout: 10000
+    });
+    link.start();
+
+    this.client = new PeerRPCClient(link, {});
+    this.client.init();
   }
 
   submitOrder = order => {
-    const clientOrder = { ...order, clientId: this.clientId };
-    this.client.map('distributed_exchange', clientOrder, { timeout: 100000 }, (err, result) => {
+    // Add the order to local orderBook
+    this.orderBook.addOrder(order);
+
+    // call all the nodes of order submit service so that they can initiate the order fulfillment
+    this.client.map('order_submit_service', order, { timeout: 10000 }, (err, result) => {
       if (err) {
         throw err;
       }
-
-      console.log('Placed order: ', order, ', got response: ', result);
     });
   }
 }

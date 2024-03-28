@@ -9,14 +9,7 @@ const OrderStatus = {
     FAILURE: 'failure'
 }
 
-const Currencies = {
-    BTC: 'bitcoin',
-    ETH: 'etherium',
-    USD: 'united states dollor'
-}
-
 module.exports = {
     OrderStatus,
-    OrderTypes,
-    Currencies
+    OrderTypes
 }
